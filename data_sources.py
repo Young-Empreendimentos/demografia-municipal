@@ -36,9 +36,17 @@ def _cache_path(chave: str) -> Path:
 
 
 def _ler_cache(chave: str) -> pd.DataFrame | None:
+    """Lê o cache. Prioriza parquet (local/CLI); cai para CSV se só houver CSV
+    (usado na versão web/stlite, que roda no navegador sem pyarrow)."""
     caminho = _cache_path(chave)
     if caminho.exists():
         return pd.read_parquet(caminho)
+    csv = caminho.with_suffix(".csv")
+    if csv.exists():
+        df = pd.read_csv(csv)
+        if "id_municipio" in df.columns:  # preserva o id como texto de 7 díg.
+            df["id_municipio"] = df["id_municipio"].astype(str)
+        return df
     return None
 
 

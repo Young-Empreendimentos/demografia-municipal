@@ -1,0 +1,1912 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Demografia Municipal — Brasil/RS</title>
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.css" />
+  <style>
+    #loading { font-family: sans-serif; padding: 2rem; color: #444; }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div id="loading">Carregando o app (primeira vez baixa o Python no
+      navegador — pode levar ~10–20 s)…</div>
+  </div>
+  <script type="module">
+    import { mount } from
+      "https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.js";
+    mount(
+      {
+        entrypoint: "app.py",
+        requirements: ["pandas", "matplotlib", "unidecode"],
+        files: {
+    "config.py": `"""
+Configuração central do app de demografia municipal.
+
+O único parâmetro que você PRECISA definir é o \`billing_project_id\` do Google
+Cloud, usado pelo pacote \`basedosdados\` para faturar as consultas ao BigQuery.
+
+Ordem de resolução do billing_project_id (a primeira que existir vence):
+  1. variável de ambiente BILLING_PROJECT_ID
+  2. variável de ambiente GOOGLE_CLOUD_PROJECT
+  3. arquivo local \`.billing_project\` (uma linha com o id do projeto)
+
+Consulte o README para instruções de autenticação (\`gcloud auth ...\`).
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Diretórios
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+CACHE_DIR = BASE_DIR / "cache"
+OUTPUT_DIR = BASE_DIR / "output"
+CACHE_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Janela temporal padrão
+# ---------------------------------------------------------------------------
+# SINASC/SIM têm boa cobertura a partir de ~1996; população IBGE por município
+# começa em 2000. Restringimos a partir de 2000 por padrão, mas o usuário pode
+# ampliar. 2022 é o último censo consolidado.
+ANO_INICIAL = int(os.environ.get("DEMOG_ANO_INICIAL", 2000))
+ANO_FINAL = int(os.environ.get("DEMOG_ANO_FINAL", 2022))
+
+# Anos censitários conhecidos (o restante da série IBGE é estimativa anual).
+ANOS_CENSO = {2000, 2010, 2022}
+
+# Intervalos intercensitários usados no cálculo robusto do saldo migratório.
+INTERVALOS_CENSO = [(2000, 2010), (2010, 2022)]
+
+# ---------------------------------------------------------------------------
+# Correção de fronteira temporal
+# ---------------------------------------------------------------------------
+# Os censos têm data de referência em ~1º de agosto (2000, 2010 e 2022). Os
+# eventos vitais são somados por ano-calendário. Sem correção, somar os anos
+# de ponta inteiros inclui meses fora do intervalo censo-a-censo e superestima
+# o crescimento vegetativo. Com FRACIONAR_FRONTEIRA=True, ponderamos os anos de
+# ponta pela fração de meses dentro do intervalo (ano inicial: ago–dez = 5/12;
+# ano final: jan–jul = 7/12), somando exatamente (fim − ini) anos.
+MES_REFERENCIA_CENSO = int(os.environ.get("DEMOG_MES_CENSO", 8))  # agosto
+FRACIONAR_FRONTEIRA = os.environ.get("DEMOG_FRACIONAR", "1") not in ("0", "false", "False")
+
+
+def peso_ano_intercenso(ano: int, ini: int, fim: int) -> float:
+    """Peso (0..1) do ano-calendário \`ano\` dentro do intervalo censitário
+    [ini, fim], considerando a data de referência dos censos (mês
+    MES_REFERENCIA_CENSO). Fora do intervalo → 0. Soma dos pesos = fim − ini."""
+    m = MES_REFERENCIA_CENSO
+    if ano < ini or ano > fim:
+        return 0.0
+    if ano == ini:
+        return (13 - m) / 12.0  # de 1º/ago a 31/dez = 5/12 (m=8)
+    if ano == fim:
+        return (m - 1) / 12.0   # de 1º/jan a 1º/ago = 7/12 (m=8)
+    return 1.0
+
+# ---------------------------------------------------------------------------
+# Sinalização de pequenas áreas (NÃO remove nada; apenas marca)
+# ---------------------------------------------------------------------------
+# Em municípios pequenos o saldo migratório pode ser da ordem do ruído (erro
+# censitário + sub-registro). Marcamos, mas mantemos todos os valores.
+LIMIAR_PEQUENA_AREA = int(os.environ.get("DEMOG_LIMIAR_PEQUENO", 5000))
+
+# ---------------------------------------------------------------------------
+# Correção de sub-registro de nascimentos/óbitos (SINASC/SIM)
+# ---------------------------------------------------------------------------
+# O resíduo herda o sub-registro dos eventos vitais. Corrigimos dividindo a
+# contagem pela COBERTURA estimada (fator = 1/cobertura ≥ 1). As coberturas
+# abaixo são APROXIMADAS, por Grande Região, baseadas na literatura (Scielo/
+# RIPSA/IBGE): Sul e Sudeste têm cobertura alta e estável; Norte e Nordeste,
+# menor (sobretudo no início da série). SUBSTITUA pelos fatores oficiais do
+# IBGE por UF/ano (Estimativas de Sub-Registro) para rigor — ou forneça um CSV
+# \`fatores_subregistro.csv\` (colunas: sigla_uf, fator_nascimentos, fator_obitos).
+APLICAR_SUBREGISTRO = os.environ.get("DEMOG_SUBREGISTRO", "1") not in ("0", "false", "False")
+
+# Grande Região de cada UF
+UF_REGIAO = {
+    "RO": "Norte", "AC": "Norte", "AM": "Norte", "RR": "Norte", "PA": "Norte",
+    "AP": "Norte", "TO": "Norte",
+    "MA": "Nordeste", "PI": "Nordeste", "CE": "Nordeste", "RN": "Nordeste",
+    "PB": "Nordeste", "PE": "Nordeste", "AL": "Nordeste", "SE": "Nordeste",
+    "BA": "Nordeste",
+    "MG": "Sudeste", "ES": "Sudeste", "RJ": "Sudeste", "SP": "Sudeste",
+    "PR": "Sul", "SC": "Sul", "RS": "Sul",
+    "MS": "Centro-Oeste", "MT": "Centro-Oeste", "GO": "Centro-Oeste",
+    "DF": "Centro-Oeste",
+}
+
+# Cobertura APROXIMADA por região {nascimentos, obitos}. Valores conservadores.
+COBERTURA_REGIAO = {
+    "Sul":          {"nascimentos": 0.99, "obitos": 0.98},
+    "Sudeste":      {"nascimentos": 0.99, "obitos": 0.98},
+    "Centro-Oeste": {"nascimentos": 0.98, "obitos": 0.96},
+    "Nordeste":     {"nascimentos": 0.95, "obitos": 0.90},
+    "Norte":        {"nascimentos": 0.93, "obitos": 0.88},
+}
+
+
+def fatores_subregistro(sigla_uf: str) -> dict:
+    """Fatores de correção {nascimentos, obitos} (=1/cobertura) para a UF.
+
+    Precedência: CSV \`fatores_subregistro.csv\` (se existir, por UF) sobre os
+    defaults regionais aproximados. Retorna {'nascimentos':1.0,'obitos':1.0} se
+    a correção estiver desligada.
+    """
+    if not APLICAR_SUBREGISTRO:
+        return {"nascimentos": 1.0, "obitos": 1.0, "fonte": "desligado"}
+
+    # CSV opcional do usuário (valores oficiais do IBGE, por UF)
+    csv = BASE_DIR / "fatores_subregistro.csv"
+    if csv.exists():
+        import csv as _csv
+        with csv.open(encoding="utf-8-sig") as fh:
+            for row in _csv.DictReader(fh):
+                if row.get("sigla_uf", "").upper() == sigla_uf.upper():
+                    return {
+                        "nascimentos": float(row["fator_nascimentos"]),
+                        "obitos": float(row["fator_obitos"]),
+                        "fonte": "csv",
+                    }
+
+    regiao = UF_REGIAO.get(sigla_uf.upper(), "Sul")
+    cob = COBERTURA_REGIAO[regiao]
+    return {
+        "nascimentos": round(1.0 / cob["nascimentos"], 4),
+        "obitos": round(1.0 / cob["obitos"], 4),
+        "fonte": f"aproximado ({regiao})",
+    }
+
+# Código IBGE de 2 dígitos por UF (prefixo do id_municipio de 7 dígitos).
+UF_COD = {
+    "RO": "11", "AC": "12", "AM": "13", "RR": "14", "PA": "15",
+    "AP": "16", "TO": "17", "MA": "21", "PI": "22", "CE": "23",
+    "RN": "24", "PB": "25", "PE": "26", "AL": "27", "SE": "28",
+    "BA": "29", "MG": "31", "ES": "32", "RJ": "33", "SP": "35",
+    "PR": "41", "SC": "42", "RS": "43", "MS": "50", "MT": "51",
+    "GO": "52", "DF": "53",
+}
+
+
+def prefixo_uf(sigla_uf: str) -> str:
+    """Prefixo (2 díg.) do id_municipio para a UF; ValueError se desconhecida."""
+    try:
+        return UF_COD[sigla_uf.upper()]
+    except KeyError as exc:
+        raise ValueError(f"UF desconhecida: {sigla_uf}") from exc
+
+
+# mapa inverso: prefixo (2 díg.) -> sigla da UF
+_COD_UF = {v: k for k, v in UF_COD.items()}
+
+
+def uf_por_id(id_municipio: str) -> str:
+    """Sigla da UF a partir do id_municipio de 7 dígitos (pelos 2 primeiros)."""
+    prefixo = str(id_municipio)[:2]
+    try:
+        return _COD_UF[prefixo]
+    except KeyError as exc:
+        raise ValueError(f"Prefixo de UF desconhecido em {id_municipio}") from exc
+
+# ---------------------------------------------------------------------------
+# billing_project_id
+# ---------------------------------------------------------------------------
+def get_billing_project_id() -> str | None:
+    """Descobre o billing_project_id conforme a ordem documentada acima."""
+    for var in ("BILLING_PROJECT_ID", "GOOGLE_CLOUD_PROJECT"):
+        val = os.environ.get(var)
+        if val:
+            return val.strip()
+
+    arquivo = BASE_DIR / ".billing_project"
+    if arquivo.exists():
+        conteudo = arquivo.read_text(encoding="utf-8").strip()
+        if conteudo:
+            return conteudo
+    return None
+`,
+    "data_sources.py": `"""
+Acesso às fontes de dados via Base dos Dados (BigQuery), com cache local em
+parquet para controle de custo.
+
+Fontes:
+  * Nascimentos : basedosdados.br_ms_sinasc.microdados   (SINASC/MS)
+  * Óbitos      : basedosdados.br_ms_sim.microdados       (SIM/MS)
+  * População   : basedosdados.br_ibge_populacao.municipio (IBGE)
+  * Diretório   : basedosdados.br_bd_diretorios_brasil.municipio
+
+Cada função de consulta grava o resultado em \`cache/<chave>.parquet\`. Numa
+segunda execução com os mesmos parâmetros, os dados vêm do parquet e NENHUMA
+consulta é feita ao BigQuery (a menos que force=True).
+
+As contagens de nascimentos/óbitos são feitas por \`id_municipio_residencia\`.
+Registros sem município de residência (id nulo) são naturalmente descartados
+pelo GROUP BY do BigQuery; o volume descartado é reportado à parte por
+\`contar_descartados_sem_residencia\`.
+"""
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import pandas as pd
+
+import config
+
+# ---------------------------------------------------------------------------
+# Camada de cache
+# ---------------------------------------------------------------------------
+def _cache_path(chave: str) -> Path:
+    """Nome de arquivo seguro derivado de uma chave textual."""
+    slug = hashlib.md5(chave.encode("utf-8")).hexdigest()[:16]
+    return config.CACHE_DIR / f"{chave.split('|')[0]}_{slug}.parquet"
+
+
+def _ler_cache(chave: str) -> pd.DataFrame | None:
+    """Lê o cache. Prioriza parquet (local/CLI); cai para CSV se só houver CSV
+    (usado na versão web/stlite, que roda no navegador sem pyarrow)."""
+    caminho = _cache_path(chave)
+    if caminho.exists():
+        return pd.read_parquet(caminho)
+    csv = caminho.with_suffix(".csv")
+    if csv.exists():
+        df = pd.read_csv(csv)
+        if "id_municipio" in df.columns:  # preserva o id como texto de 7 díg.
+            df["id_municipio"] = df["id_municipio"].astype(str)
+        return df
+    return None
+
+
+def _gravar_cache(chave: str, df: pd.DataFrame) -> None:
+    df.to_parquet(_cache_path(chave), index=False)
+
+
+# ---------------------------------------------------------------------------
+# Execução de SQL no BigQuery (lazy import do basedosdados)
+# ---------------------------------------------------------------------------
+def _run_query(sql: str) -> pd.DataFrame:
+    """Executa uma query no BigQuery via basedosdados.
+
+    O import é adiado para dentro da função para que o resto do programa
+    (ex.: leitura de cache, testes) funcione mesmo sem o pacote instalado.
+    """
+    billing = config.get_billing_project_id()
+    if not billing:
+        raise RuntimeError(
+            "billing_project_id não configurado. Defina a variável de ambiente "
+            "BILLING_PROJECT_ID ou crie o arquivo \`.billing_project\`. "
+            "Veja o README."
+        )
+    try:
+        import basedosdados as bd
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "Pacote \`basedosdados\` não instalado. Rode: pip install basedosdados"
+        ) from exc
+
+    return bd.read_sql(sql, billing_project_id=billing)
+
+
+# ---------------------------------------------------------------------------
+# Consultas
+# ---------------------------------------------------------------------------
+def carregar_diretorio_municipios(force: bool = False) -> pd.DataFrame:
+    """Tabela de diretório: id_municipio (7 díg.), nome, sigla_uf.
+
+    Colunas retornadas: id_municipio (str), nome (str), sigla_uf (str).
+    """
+    chave = "diretorio-municipios"
+    if not force:
+        cache = _ler_cache(chave)
+        if cache is not None:
+            return cache
+
+    sql = """
+        SELECT id_municipio, nome, sigla_uf
+        FROM \`basedosdados.br_bd_diretorios_brasil.municipio\`
+    """
+    df = _run_query(sql)
+    df["id_municipio"] = df["id_municipio"].astype(str)
+    _gravar_cache(chave, df)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Modo NACIONAL (Brasil inteiro) — baixa uma vez, serve todos os municípios.
+#
+# Custo: como as tabelas de eventos são particionadas por \`ano\`, o BigQuery lê
+# as MESMAS colunas/bytes das partições selecionadas independentemente de haver
+# ou não filtro por UF. Ou seja, baixar o Brasil todo custa ~o mesmo que baixar
+# uma única UF; o resultado (parquet) tem só ~130 mil linhas por tabela.
+#
+# Quando um cache nacional (\`*-BR.parquet\`) existe, os loaders por UF fatiam
+# dele (por prefixo do id_municipio = residência) SEM nova consulta ao BigQuery.
+# ---------------------------------------------------------------------------
+def carregar_populacao_br(force: bool = False) -> pd.DataFrame:
+    """População anual (IBGE) de TODOS os municípios do Brasil."""
+    chave = "populacao-BR"
+    if not force:
+        cache = _ler_cache(chave)
+        if cache is not None:
+            return cache
+    sql = f"""
+        SELECT ano, id_municipio, populacao
+        FROM \`basedosdados.br_ibge_populacao.municipio\`
+        WHERE ano BETWEEN {config.ANO_INICIAL} AND {config.ANO_FINAL}
+    """
+    df = _run_query(sql)
+    df["id_municipio"] = df["id_municipio"].astype(str)
+    df["ano"] = df["ano"].astype(int)
+    df["populacao"] = df["populacao"].astype("int64")
+    _gravar_cache(chave, df)
+    return df
+
+
+def _carregar_eventos_br_raw(
+    tabela: str, coluna_saida: str, force: bool
+) -> pd.DataFrame:
+    """Contagem de eventos por RESIDÊNCIA e ano, Brasil todo — INCLUINDO as
+    linhas sem município de residência (id nulo), que formam seu próprio grupo.
+
+    Guardar as linhas de id nulo aqui permite reportar os "descartados" sem uma
+    segunda varredura da tabela (economia de custo). O cache bruto tem a chave
+    \`<coluna>-BR\`. As linhas de id nulo são separadas na leitura pública.
+    """
+    chave = f"{coluna_saida}-BR"
+    if not force:
+        cache = _ler_cache(chave)
+        if cache is not None:
+            return cache
+    # Sem 'IS NOT NULL': o id nulo vira um grupo (descartados), na MESMA leitura.
+    sql = f"""
+        SELECT dados.ano AS ano,
+               dados.id_municipio_residencia AS id_municipio,
+               COUNT(*) AS {coluna_saida}
+        FROM \`{tabela}\` AS dados
+        WHERE dados.ano BETWEEN {config.ANO_INICIAL} AND {config.ANO_FINAL}
+        GROUP BY ano, id_municipio
+    """
+    df = _run_query(sql)
+    # id_municipio pode ser nulo (descartados) -> tipo nullable string
+    df["id_municipio"] = df["id_municipio"].astype("string")
+    df["ano"] = df["ano"].astype(int)
+    df[coluna_saida] = df[coluna_saida].astype("int64")
+    _gravar_cache(chave, df)
+    return df
+
+
+def _carregar_eventos_br(
+    tabela: str, coluna_saida: str, force: bool
+) -> pd.DataFrame:
+    """Versão municipal-utilizável: exclui as linhas de id nulo (descartados)."""
+    raw = _carregar_eventos_br_raw(tabela, coluna_saida, force)
+    return raw[raw["id_municipio"].notna()].reset_index(drop=True)
+
+
+def carregar_nascimentos_br(force: bool = False) -> pd.DataFrame:
+    return _carregar_eventos_br(
+        "basedosdados.br_ms_sinasc.microdados", "nascimentos", force
+    )
+
+
+def carregar_obitos_br(force: bool = False) -> pd.DataFrame:
+    return _carregar_eventos_br(
+        "basedosdados.br_ms_sim.microdados", "obitos", force
+    )
+
+
+def contar_descartados_br() -> pd.DataFrame:
+    """Descartados nacionais (id de residência nulo), extraídos do cache bruto
+    já baixado — SEM nova consulta. Colunas: fonte, ano, descartados.
+    Retorna vazio se o cache nacional ainda não existe."""
+    linhas = []
+    for tabela, coluna, fonte in [
+        ("basedosdados.br_ms_sinasc.microdados", "nascimentos", "nascimentos"),
+        ("basedosdados.br_ms_sim.microdados", "obitos", "obitos"),
+    ]:
+        cache = _ler_cache(f"{coluna}-BR")
+        if cache is None:
+            continue
+        nulos = cache[cache["id_municipio"].isna()]
+        for _, r in nulos.iterrows():
+            linhas.append(
+                {"fonte": fonte, "ano": int(r["ano"]),
+                 "descartados": int(r[coluna])}
+            )
+    return pd.DataFrame(linhas, columns=["fonte", "ano", "descartados"])
+
+
+def baixar_brasil(force: bool = False) -> dict[str, int]:
+    """Baixa e cacheia as tabelas nacionais de uma vez (2 varreduras: SINASC e
+    SIM; população e diretório são baratos). Depois, tudo é servido do cache
+    local. Retorna contagem de linhas municipais por tabela."""
+    dire = carregar_diretorio_municipios(force)
+    pop = carregar_populacao_br(force)
+    nasc = carregar_nascimentos_br(force)
+    obit = carregar_obitos_br(force)
+    return {
+        "diretorio": len(dire),
+        "populacao": len(pop),
+        "nascimentos": len(nasc),
+        "obitos": len(obit),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Loaders por UF (fatiam do cache nacional se existir; senão consultam a UF)
+# ---------------------------------------------------------------------------
+def _fatiar_uf(nacional: pd.DataFrame, sigla_uf: str) -> pd.DataFrame:
+    """Filtra o cache nacional para uma UF pelo prefixo do id_municipio."""
+    prefixo = config.prefixo_uf(sigla_uf)
+    mask = nacional["id_municipio"].str.startswith(prefixo, na=False)
+    # devolve id como str simples (não nullable) para consistência a jusante
+    out = nacional[mask].copy()
+    out["id_municipio"] = out["id_municipio"].astype(str)
+    return out.reset_index(drop=True)
+
+
+def carregar_populacao(sigla_uf: str, force: bool = False) -> pd.DataFrame:
+    """População anual (IBGE) de uma UF.
+
+    Se o cache nacional existir, fatia dele; senão consulta só a UF.
+    Colunas: ano (int), id_municipio (str), populacao (int).
+    """
+    if not force and _ler_cache("populacao-BR") is not None:
+        return _fatiar_uf(carregar_populacao_br(), sigla_uf)
+
+    chave = f"populacao-{sigla_uf}"
+    if not force:
+        cache = _ler_cache(chave)
+        if cache is not None:
+            return cache
+    sql = f"""
+        SELECT ano, id_municipio, populacao
+        FROM \`basedosdados.br_ibge_populacao.municipio\`
+        WHERE sigla_uf = '{sigla_uf}'
+          AND ano BETWEEN {config.ANO_INICIAL} AND {config.ANO_FINAL}
+    """
+    df = _run_query(sql)
+    df["id_municipio"] = df["id_municipio"].astype(str)
+    df["ano"] = df["ano"].astype(int)
+    df["populacao"] = df["populacao"].astype("int64")
+    _gravar_cache(chave, df)
+    return df
+
+
+def _carregar_eventos(
+    tabela: str, coluna_saida: str, sigla_uf: str, force: bool
+) -> pd.DataFrame:
+    """Contagem de eventos vitais por município de RESIDÊNCIA e ano, para uma UF.
+
+    Se o cache nacional existir, fatia dele; senão consulta só a UF (filtro por
+    UF de OCORRÊNCIA). Retorna: ano (int), id_municipio (str), <coluna_saida> (int).
+    """
+    if not force and _ler_cache(f"{coluna_saida}-BR") is not None:
+        return _fatiar_uf(_carregar_eventos_br(tabela, coluna_saida, False), sigla_uf)
+
+    chave = f"{coluna_saida}-{sigla_uf}"
+    if not force:
+        cache = _ler_cache(chave)
+        if cache is not None:
+            return cache
+    sql = f"""
+        SELECT dados.ano AS ano,
+               dados.id_municipio_residencia AS id_municipio,
+               COUNT(*) AS {coluna_saida}
+        FROM \`{tabela}\` AS dados
+        WHERE dados.sigla_uf = '{sigla_uf}'
+          AND dados.ano BETWEEN {config.ANO_INICIAL} AND {config.ANO_FINAL}
+          AND dados.id_municipio_residencia IS NOT NULL
+        GROUP BY ano, id_municipio
+    """
+    df = _run_query(sql)
+    df["id_municipio"] = df["id_municipio"].astype(str)
+    df["ano"] = df["ano"].astype(int)
+    df[coluna_saida] = df[coluna_saida].astype("int64")
+    _gravar_cache(chave, df)
+    return df
+
+
+def carregar_nascimentos(sigla_uf: str, force: bool = False) -> pd.DataFrame:
+    return _carregar_eventos(
+        "basedosdados.br_ms_sinasc.microdados", "nascimentos", sigla_uf, force
+    )
+
+
+def carregar_obitos(sigla_uf: str, force: bool = False) -> pd.DataFrame:
+    return _carregar_eventos(
+        "basedosdados.br_ms_sim.microdados", "obitos", sigla_uf, force
+    )
+
+
+def contar_descartados_sem_residencia(
+    sigla_uf: str, force: bool = False
+) -> pd.DataFrame:
+    """Quantifica eventos SEM município de residência (id nulo), por fonte e ano.
+
+    Serve para reportar o volume descartado dos totais municipais.
+    Colunas: fonte (str), ano (int), descartados (int).
+    """
+    chave = f"descartados-{sigla_uf}"
+    if not force:
+        cache = _ler_cache(chave)
+        if cache is not None:
+            return cache
+
+    def _q(tabela: str, fonte: str) -> pd.DataFrame:
+        sql = f"""
+            SELECT dados.ano AS ano, COUNT(*) AS descartados
+            FROM \`{tabela}\` AS dados
+            WHERE dados.sigla_uf = '{sigla_uf}'
+              AND dados.ano BETWEEN {config.ANO_INICIAL} AND {config.ANO_FINAL}
+              AND dados.id_municipio_residencia IS NULL
+            GROUP BY ano
+        """
+        d = _run_query(sql)
+        d["fonte"] = fonte
+        return d
+
+    df = pd.concat(
+        [
+            _q("basedosdados.br_ms_sinasc.microdados", "nascimentos"),
+            _q("basedosdados.br_ms_sim.microdados", "obitos"),
+        ],
+        ignore_index=True,
+    )
+    if not df.empty:
+        df["ano"] = df["ano"].astype(int)
+        df["descartados"] = df["descartados"].astype("int64")
+    _gravar_cache(chave, df)
+    return df
+`,
+    "municipios.py": `"""
+Resolução de municípios: nome (com acento/maiúsculas normalizados) ou código
+IBGE de 7 dígitos -> id_municipio + metadados.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pandas as pd
+from unidecode import unidecode
+
+import config
+import data_sources
+
+
+@dataclass
+class Municipio:
+    id_municipio: str
+    nome: str
+    sigla_uf: str
+
+    def __str__(self) -> str:
+        return f"{self.nome}/{self.sigla_uf} ({self.id_municipio})"
+
+
+def _normalizar(texto: str) -> str:
+    """Remove acentos, espaços extras e caixa para comparação robusta."""
+    return unidecode(str(texto)).strip().lower()
+
+
+def resolver(
+    consulta: str | int, sigla_uf: str | None = None
+) -> Municipio:
+    """Resolve um município por código IBGE (7 díg.) ou por nome.
+
+    - Se \`consulta\` tiver 7 dígitos numéricos, é tratada como id_municipio.
+    - Caso contrário, é tratada como nome (match exato normalizado; se houver
+      mais de um no Brasil, use \`sigla_uf\` para desambiguar).
+
+    Levanta ValueError com sugestões quando não há match único.
+    """
+    # O diretório de nomes pode não estar disponível (sem BigQuery e sem o CSV
+    # de diretório importado). Nesse caso ainda resolvemos por CÓDIGO IBGE.
+    try:
+        diretorio = data_sources.carregar_diretorio_municipios()
+    except Exception:
+        diretorio = None
+    consulta_str = str(consulta).strip()
+
+    # --- Caminho 1: código IBGE ------------------------------------------
+    if consulta_str.isdigit() and len(consulta_str) == 7:
+        if diretorio is not None:
+            linha = diretorio[diretorio["id_municipio"] == consulta_str]
+            if not linha.empty:
+                r = linha.iloc[0]
+                return Municipio(r["id_municipio"], r["nome"], r["sigla_uf"])
+        # fallback: sem diretório, derivamos a UF pelo prefixo do código
+        return Municipio(
+            consulta_str, f"Município {consulta_str}", config.uf_por_id(consulta_str)
+        )
+
+    # --- Caminho 2: nome (requer diretório) ------------------------------
+    if diretorio is None:
+        raise ValueError(
+            "Busca por nome requer o diretório de municípios. Importe o CSV do "
+            "diretório (--diretorio no importar_csv.py) ou rode --baixar-brasil; "
+            "ou use o código IBGE de 7 dígitos."
+        )
+    alvo = _normalizar(consulta_str)
+    diretorio = diretorio.assign(_norm=diretorio["nome"].map(_normalizar))
+    candidatos = diretorio[diretorio["_norm"] == alvo]
+
+    if sigla_uf:
+        candidatos = candidatos[candidatos["sigla_uf"] == sigla_uf.upper()]
+
+    if len(candidatos) == 1:
+        r = candidatos.iloc[0]
+        return Municipio(r["id_municipio"], r["nome"], r["sigla_uf"])
+
+    if candidatos.empty:
+        # busca aproximada por substring para dar sugestões úteis
+        parecidos = diretorio[diretorio["_norm"].str.contains(alvo, na=False)]
+        sugestoes = ", ".join(
+            f"{r.nome}/{r.sigla_uf}" for r in parecidos.head(8).itertuples()
+        )
+        extra = f" Você quis dizer: {sugestoes}?" if sugestoes else ""
+        raise ValueError(f"Município não encontrado: '{consulta}'.{extra}")
+
+    # múltiplos estados com o mesmo nome
+    ufs = ", ".join(sorted(candidatos["sigla_uf"].unique()))
+    raise ValueError(
+        f"'{consulta}' existe em mais de uma UF ({ufs}). "
+        f"Especifique a UF (ex.: --uf RS) ou use o código IBGE de 7 dígitos."
+    )
+
+
+def listar_por_uf(sigla_uf: str) -> pd.DataFrame:
+    """Lista municípios de uma UF (para dropdown/autocomplete), ordenados por nome."""
+    diretorio = data_sources.carregar_diretorio_municipios()
+    df = diretorio[diretorio["sigla_uf"] == sigla_uf.upper()].copy()
+    return df.sort_values("nome").reset_index(drop=True)
+`,
+    "calculations.py": `"""
+Cálculos demográficos: crescimento vegetativo e saldo migratório (método do
+resíduo), tanto na série anual (aproximação) quanto entre censos (mais robusto).
+
+Definições
+----------
+Crescimento vegetativo(t) = nascimentos(t) − óbitos(t)
+
+Saldo migratório LÍQUIDO (não separa entrada/saída; inclui migração interna,
+internacional e qualquer reconciliação estatística):
+
+  * Série anual (aproximação, usa estimativas anuais de população):
+        Saldo(t) ≈ (Pop(t+1) − Pop(t)) − vegetativo(t)
+
+  * Intercensitário (mais robusto, usa anos de censo):
+        Saldo = (Pop_censo_final − Pop_censo_inicial) − Σ vegetativo no período
+    Somamos o vegetativo dos anos [inicial, final] inclusive em cada intervalo
+    censitário; esta convenção reproduz o agregado RS de referência (2010–2022:
+    veg ≈ 625 mil, saldo ≈ −438 mil). Como o censo tem referência em julho e os
+    eventos são somados por ano-calendário, há leve descasamento — use para
+    tendência, não como número exato.
+
+Saldo em % = saldo ÷ população inicial (do ano t na série anual).
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+import config
+import data_sources
+
+
+# ---------------------------------------------------------------------------
+# Correção de sub-registro (SINASC/SIM)
+# ---------------------------------------------------------------------------
+def _corrigir_subregistro(serie: pd.DataFrame, sigla_uf: str) -> pd.DataFrame:
+    """Multiplica nascimentos/óbitos pelos fatores 1/cobertura da UF (config).
+    Não faz nada se a correção estiver desligada (fatores = 1.0)."""
+    fat = config.fatores_subregistro(sigla_uf)
+    serie = serie.copy()
+    serie["nascimentos"] = (
+        (serie["nascimentos"] * fat["nascimentos"]).round(0).astype("int64")
+    )
+    serie["obitos"] = (
+        (serie["obitos"] * fat["obitos"]).round(0).astype("int64")
+    )
+    return serie
+
+
+def _veg_intercenso(serie_idx: pd.DataFrame, ini: int, fim: int) -> float:
+    """Soma do vegetativo no intervalo [ini, fim], aplicando (ou não) a
+    correção de fronteira temporal (pesos por fração de ano). \`serie_idx\` deve
+    estar indexado por \`ano\` e conter a coluna 'vegetativo'."""
+    if config.FRACIONAR_FRONTEIRA:
+        total = 0.0
+        for ano in range(ini, fim + 1):
+            if ano in serie_idx.index:
+                total += serie_idx.loc[ano, "vegetativo"] * config.peso_ano_intercenso(
+                    ano, ini, fim
+                )
+        return total
+    # sem correção: soma anos-calendário inteiros [ini, fim]
+    return serie_idx.loc[
+        (serie_idx.index >= ini) & (serie_idx.index <= fim), "vegetativo"
+    ].sum()
+
+
+# ---------------------------------------------------------------------------
+# Série anual de um município
+# ---------------------------------------------------------------------------
+def construir_serie_municipio(
+    id_municipio: str, sigla_uf: str
+) -> pd.DataFrame:
+    """Monta a série anual completa de um município.
+
+    Colunas de saída:
+        ano, tipo_populacao ('censo'/'estimativa'), populacao,
+        nascimentos, obitos, vegetativo, saldo_migratorio, saldo_pct
+    """
+    pop = data_sources.carregar_populacao(sigla_uf)
+    nasc = data_sources.carregar_nascimentos(sigla_uf)
+    obit = data_sources.carregar_obitos(sigla_uf)
+
+    pop_m = pop[pop["id_municipio"] == id_municipio][["ano", "populacao"]]
+    nasc_m = nasc[nasc["id_municipio"] == id_municipio][["ano", "nascimentos"]]
+    obit_m = obit[obit["id_municipio"] == id_municipio][["ano", "obitos"]]
+
+    # A população é o "esqueleto" temporal: existe para todos os anos.
+    serie = (
+        pop_m.merge(nasc_m, on="ano", how="left")
+        .merge(obit_m, on="ano", how="left")
+        .sort_values("ano")
+        .reset_index(drop=True)
+    )
+    # Ausência de nascimento/óbito num ano com população significa zero eventos
+    # (municípios pequenos), não dado faltante.
+    serie["nascimentos"] = serie["nascimentos"].fillna(0).astype("int64")
+    serie["obitos"] = serie["obitos"].fillna(0).astype("int64")
+
+    # Correção de sub-registro (SINASC/SIM): multiplica por 1/cobertura.
+    serie = _corrigir_subregistro(serie, sigla_uf)
+
+    # Marca censo vs estimativa
+    serie["tipo_populacao"] = serie["ano"].map(
+        lambda a: "censo" if a in config.ANOS_CENSO else "estimativa"
+    )
+
+    # Crescimento vegetativo
+    serie["vegetativo"] = serie["nascimentos"] - serie["obitos"]
+
+    # Saldo migratório anual (resíduo): usa Pop(t+1)
+    pop_next = serie["populacao"].shift(-1)
+    serie["saldo_migratorio"] = (pop_next - serie["populacao"]) - serie[
+        "vegetativo"
+    ]
+    # Saldo em % da população inicial (do ano t)
+    serie["saldo_pct"] = (
+        serie["saldo_migratorio"] / serie["populacao"] * 100
+    ).round(3)
+
+    # Arredonda o saldo (o resíduo pode ter frações por conta dos tipos)
+    serie["saldo_migratorio"] = serie["saldo_migratorio"].round(0)
+
+    return serie[
+        [
+            "ano",
+            "tipo_populacao",
+            "populacao",
+            "nascimentos",
+            "obitos",
+            "vegetativo",
+            "saldo_migratorio",
+            "saldo_pct",
+        ]
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Saldo migratório intercensitário
+# ---------------------------------------------------------------------------
+def saldo_intercensitario(serie: pd.DataFrame) -> pd.DataFrame:
+    """Calcula o saldo migratório robusto para cada intervalo censitário.
+
+    Recebe a série anual (de \`construir_serie_municipio\` ou o agregado de UF) e
+    retorna uma linha por intervalo com Δpop, vegetativo acumulado, saldo e %.
+    """
+    serie = serie.set_index("ano")
+    linhas = []
+    for ini, fim in config.INTERVALOS_CENSO:
+        if ini not in serie.index or fim not in serie.index:
+            continue
+        pop_ini = serie.loc[ini, "populacao"]
+        pop_fim = serie.loc[fim, "populacao"]
+        # Vegetativo do período. Com FRACIONAR_FRONTEIRA (default), os anos de
+        # ponta são ponderados pela fração de meses dentro do intervalo (censo
+        # ~1º/ago), somando exatamente (fim − ini) anos. Sem a correção, soma os
+        # anos-calendário [ini, fim] inteiros.
+        veg = _veg_intercenso(serie, ini, fim)
+        delta_pop = pop_fim - pop_ini
+        saldo = delta_pop - veg
+        linhas.append(
+            {
+                "intervalo": f"{ini}-{fim}",
+                "pop_inicial": int(pop_ini),
+                "pop_final": int(pop_fim),
+                "delta_pop": int(delta_pop),
+                "vegetativo_acumulado": int(veg),
+                "saldo_migratorio": int(round(saldo)),
+                "saldo_pct": round(saldo / pop_ini * 100, 2),
+            }
+        )
+    return pd.DataFrame(linhas)
+
+
+# ---------------------------------------------------------------------------
+# Uniformização dos rebaseamentos (reconstrução intercensitária)
+# ---------------------------------------------------------------------------
+def reconstruir_serie(serie: pd.DataFrame, metodo: str = "uniforme") -> pd.DataFrame:
+    """Uniformiza os saltos de rebaseamento das estimativas do IBGE.
+
+    Em vez de diferenciar as estimativas anuais (ruidosas), ancoramos nos censos
+    e reconstruímos a população pela equação de balanço demográfico:
+        Pop(t+1) = Pop(t) + vegetativo(t) + migração(t)
+    O saldo migratório TOTAL de cada intervalo intercensitário é fixado pelas
+    âncoras — Total = (Pop_censo_final − Pop_censo_inicial) − Σ vegetativo — e
+    distribuído suavemente entre os anos, eliminando os picos artificiais.
+
+    metodo:
+      'uniforme'     → mesma migração absoluta por ano (Total / N).
+      'proporcional' → migração proporcional à população (taxa ~constante).
+
+    A série reconstruída passa EXATAMENTE pelos censos. Colunas adicionadas:
+      populacao_suave, saldo_migratorio_suave, saldo_pct_suave.
+
+    Nota: aqui o vegetativo do intervalo é somado em [inicial, final-1] (a forma
+    exigida pela equação de balanço, para a série fechar nos censos). Por isso o
+    saldo intercensitário reconstruído pode diferir levemente do valor do modo
+    bruto, que soma [inicial, final] para reproduzir a referência publicada.
+    """
+    if metodo not in ("uniforme", "proporcional"):
+        raise ValueError("metodo deve ser 'uniforme' ou 'proporcional'")
+
+    s = serie.set_index("ano").sort_index()
+    pop_suave: dict[int, float] = {}
+    mig_suave: dict[int, float] = {}
+
+    for ini, fim in config.INTERVALOS_CENSO:
+        if ini not in s.index or fim not in s.index:
+            continue
+        transicoes = list(range(ini, fim))  # t = ini .. fim-1
+        veg = s.loc[ini:fim - 1, "vegetativo"]  # N termos, um por transição
+        total_mig = (s.loc[fim, "populacao"] - s.loc[ini, "populacao"]) - veg.sum()
+
+        if metodo == "proporcional":
+            pesos = s.loc[ini:fim - 1, "populacao"].astype(float)
+            pesos = pesos / pesos.sum()
+            mig = {t: total_mig * pesos.loc[t] for t in transicoes}
+        else:  # uniforme
+            mig = {t: total_mig / len(transicoes) for t in transicoes}
+
+        pop_suave[ini] = float(s.loc[ini, "populacao"])  # âncora inicial
+        for t in transicoes:
+            mig_suave[t] = mig[t]
+            pop_suave[t + 1] = pop_suave[t] + float(s.loc[t, "vegetativo"]) + mig[t]
+
+    out = serie.copy()
+    out["populacao_suave"] = out["ano"].map(pop_suave).round(0)
+    out["saldo_migratorio_suave"] = out["ano"].map(mig_suave).round(0)
+    out["saldo_pct_suave"] = (
+        out["saldo_migratorio_suave"] / out["populacao_suave"] * 100
+    ).round(3)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Resumo executivo
+# ---------------------------------------------------------------------------
+def resumir(serie: pd.DataFrame) -> dict:
+    """Métricas-resumo de uma série anual."""
+    if serie.empty:
+        return {}
+    idx_pico = serie["populacao"].idxmax()
+    linha_pico = serie.loc[idx_pico]
+    # saldo anual acumulado ignora o último ano (NaN por falta de Pop(t+1))
+    saldo_acum = serie["saldo_migratorio"].dropna().sum()
+    pop_min = int(serie["populacao"].min())
+    return {
+        "ano_pico_populacional": int(linha_pico["ano"]),
+        "populacao_pico": int(linha_pico["populacao"]),
+        "vegetativo_acumulado": int(serie["vegetativo"].sum()),
+        "saldo_migratorio_acumulado": int(round(saldo_acum)),
+        "ano_min": int(serie["ano"].min()),
+        "ano_max": int(serie["ano"].max()),
+        # sinaliza (não remove): município pequeno → saldo mais sujeito a ruído
+        "pequena_area": bool(pop_min < config.LIMIAR_PEQUENA_AREA),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Agregado estadual (para validação / ranking)
+# ---------------------------------------------------------------------------
+def construir_serie_uf(sigla_uf: str) -> pd.DataFrame:
+    """Agrega TODOS os municípios de uma UF por ano.
+
+    Ressalva importante: \`sigla_uf\` nas tabelas de eventos refere-se à UF de
+    OCORRÊNCIA e pode incluir residentes de outros estados. Para o universo do
+    estado, mantemos apenas \`id_municipio\` que começa com o código da UF (RS=43),
+    tanto na população quanto nos eventos.
+    """
+    prefixo = _prefixo_uf(sigla_uf)
+
+    pop = data_sources.carregar_populacao(sigla_uf)
+    nasc = data_sources.carregar_nascimentos(sigla_uf)
+    obit = data_sources.carregar_obitos(sigla_uf)
+
+    def _filtra_e_soma(df: pd.DataFrame, coluna: str) -> pd.DataFrame:
+        d = df[df["id_municipio"].str.startswith(prefixo)]
+        return d.groupby("ano", as_index=False)[coluna].sum()
+
+    pop_a = _filtra_e_soma(pop, "populacao")
+    nasc_a = _filtra_e_soma(nasc, "nascimentos")
+    obit_a = _filtra_e_soma(obit, "obitos")
+
+    serie = (
+        pop_a.merge(nasc_a, on="ano", how="left")
+        .merge(obit_a, on="ano", how="left")
+        .sort_values("ano")
+        .reset_index(drop=True)
+    )
+    serie["nascimentos"] = serie["nascimentos"].fillna(0).astype("int64")
+    serie["obitos"] = serie["obitos"].fillna(0).astype("int64")
+    serie = _corrigir_subregistro(serie, sigla_uf)  # sub-registro
+    serie["tipo_populacao"] = serie["ano"].map(
+        lambda a: "censo" if a in config.ANOS_CENSO else "estimativa"
+    )
+    serie["vegetativo"] = serie["nascimentos"] - serie["obitos"]
+    pop_next = serie["populacao"].shift(-1)
+    serie["saldo_migratorio"] = (
+        (pop_next - serie["populacao"]) - serie["vegetativo"]
+    ).round(0)
+    serie["saldo_pct"] = (
+        serie["saldo_migratorio"] / serie["populacao"] * 100
+    ).round(3)
+    return serie[
+        [
+            "ano",
+            "tipo_populacao",
+            "populacao",
+            "nascimentos",
+            "obitos",
+            "vegetativo",
+            "saldo_migratorio",
+            "saldo_pct",
+        ]
+    ]
+
+
+def _prefixo_uf(sigla_uf: str) -> str:
+    """Código IBGE de 2 dígitos da UF (prefixo do id_municipio)."""
+    return config.prefixo_uf(sigla_uf)
+
+
+# ---------------------------------------------------------------------------
+# Ranking municipal dentro de uma UF
+# ---------------------------------------------------------------------------
+def ranking_uf(sigla_uf: str, intervalo: tuple[int, int] | None = None) -> pd.DataFrame:
+    """Ranking do saldo migratório de TODOS os municípios de uma UF, no
+    intervalo intercensitário informado (default: o último, 2010–2022).
+
+    Usa o método do resíduo por município: as duas pontas do intervalo são anos
+    de CENSO (pop robusta). Aplica as mesmas correções da série: sub-registro
+    (config) e fronteira temporal (fracionamento dos anos de ponta). Como os
+    endpoints são censos, o ranking não sofre com os rebaseamentos das
+    estimativas anuais.
+
+    Colunas: id_municipio, nome, pop_inicial, pop_final, delta_pop, vegetativo,
+             saldo_migratorio, saldo_pct, pequena_area (bool). Não ordenado — a
+             UI ordena; ordenação default aqui é por saldo_migratorio desc.
+    """
+    ini, fim = intervalo or config.INTERVALOS_CENSO[-1]
+    prefixo = config.prefixo_uf(sigla_uf)
+    fat = config.fatores_subregistro(sigla_uf)
+
+    pop = data_sources.carregar_populacao(sigla_uf)
+    nasc = data_sources.carregar_nascimentos(sigla_uf)
+    obit = data_sources.carregar_obitos(sigla_uf)
+
+    def _uf(df: pd.DataFrame) -> pd.DataFrame:
+        return df[df["id_municipio"].str.startswith(prefixo)]
+
+    pop, nasc, obit = _uf(pop), _uf(nasc), _uf(obit)
+
+    # vegetativo por município e ano, com correção de sub-registro
+    ev = nasc.merge(obit, on=["ano", "id_municipio"], how="outer")
+    ev["nascimentos"] = ev["nascimentos"].fillna(0) * fat["nascimentos"]
+    ev["obitos"] = ev["obitos"].fillna(0) * fat["obitos"]
+    ev["vegetativo"] = ev["nascimentos"] - ev["obitos"]
+
+    # peso por ano (fracionamento de fronteira) e soma ponderada por município
+    ev = ev[(ev["ano"] >= ini) & (ev["ano"] <= fim)].copy()
+    if config.FRACIONAR_FRONTEIRA:
+        ev["_peso"] = ev["ano"].map(lambda a: config.peso_ano_intercenso(a, ini, fim))
+    else:
+        ev["_peso"] = 1.0
+    ev["_veg_p"] = ev["vegetativo"] * ev["_peso"]
+    veg = ev.groupby("id_municipio")["_veg_p"].sum()
+
+    p_ini = pop[pop["ano"] == ini].set_index("id_municipio")["populacao"]
+    p_fim = pop[pop["ano"] == fim].set_index("id_municipio")["populacao"]
+
+    df = pd.DataFrame({"pop_inicial": p_ini, "pop_final": p_fim})
+    df = df.dropna(subset=["pop_inicial", "pop_final"])  # exige as duas pontas
+    df["vegetativo"] = veg.reindex(df.index).fillna(0)
+    df["pop_inicial"] = df["pop_inicial"].astype("int64")
+    df["pop_final"] = df["pop_final"].astype("int64")
+    df["vegetativo"] = df["vegetativo"].round(0).astype("int64")
+    df["delta_pop"] = df["pop_final"] - df["pop_inicial"]
+    df["saldo_migratorio"] = (df["delta_pop"] - df["vegetativo"]).round(0).astype("int64")
+    df["saldo_pct"] = (df["saldo_migratorio"] / df["pop_inicial"] * 100).round(2)
+    # sinaliza pequenas áreas (NÃO remove) — saldo pode ser da ordem do ruído
+    df["pequena_area"] = df["pop_inicial"] < config.LIMIAR_PEQUENA_AREA
+
+    df = df.reset_index().rename(columns={"index": "id_municipio"})
+
+    # nomes (se o diretório estiver disponível)
+    try:
+        dire = data_sources.carregar_diretorio_municipios()
+        df = df.merge(dire[["id_municipio", "nome"]], on="id_municipio", how="left")
+    except Exception:
+        df["nome"] = df["id_municipio"]
+    df["nome"] = df["nome"].fillna(df["id_municipio"])
+
+    cols = ["id_municipio", "nome", "pop_inicial", "pop_final", "delta_pop",
+            "vegetativo", "saldo_migratorio", "saldo_pct", "pequena_area"]
+    return df[cols].sort_values("saldo_migratorio", ascending=False).reset_index(drop=True)
+`,
+    "reporting.py": `"""
+Gráficos (matplotlib), texto de fontes/ressalvas e exportação (CSV/XLSX).
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")  # backend sem tela; a CLI salva PNGs
+import matplotlib.pyplot as plt
+import pandas as pd
+
+import config
+
+
+# ---------------------------------------------------------------------------
+# Gráficos
+# ---------------------------------------------------------------------------
+def grafico_populacao(serie: pd.DataFrame, titulo: str, ax=None):
+    ax = ax or plt.gca()
+    tem_suave = "populacao_suave" in serie.columns
+    label_bruto = "Estimativa IBGE (bruta)" if tem_suave else None
+    ax.plot(serie["ano"], serie["populacao"], marker="o", color="#1f77b4",
+            alpha=0.45 if tem_suave else 1.0, label=label_bruto)
+    if tem_suave:
+        # série reconstruída (sem os saltos de rebaseamento)
+        ax.plot(serie["ano"], serie["populacao_suave"], marker="o",
+                color="#ff7f0e", label="Reconstruída (suave)")
+    # destaca anos de censo
+    censo = serie[serie["tipo_populacao"] == "censo"]
+    ax.scatter(
+        censo["ano"], censo["populacao"], color="#d62728", zorder=5,
+        label="Censo", s=60,
+    )
+    ax.set_title(f"População — {titulo}")
+    ax.set_xlabel("Ano")
+    ax.set_ylabel("População")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return ax
+
+
+def grafico_nasc_obitos(serie: pd.DataFrame, titulo: str, ax=None):
+    ax = ax or plt.gca()
+    ax.plot(serie["ano"], serie["nascimentos"], marker="o",
+            color="#2ca02c", label="Nascimentos")
+    ax.plot(serie["ano"], serie["obitos"], marker="o",
+            color="#d62728", label="Óbitos")
+    # área do crescimento vegetativo (nascimentos acima de óbitos)
+    ax.fill_between(
+        serie["ano"], serie["nascimentos"], serie["obitos"],
+        where=serie["nascimentos"] >= serie["obitos"],
+        color="#2ca02c", alpha=0.15, label="Vegetativo (+)",
+    )
+    ax.fill_between(
+        serie["ano"], serie["nascimentos"], serie["obitos"],
+        where=serie["nascimentos"] < serie["obitos"],
+        color="#d62728", alpha=0.15, label="Vegetativo (−)",
+    )
+    ax.set_title(f"Nascimentos × Óbitos — {titulo}")
+    ax.set_xlabel("Ano")
+    ax.set_ylabel("Eventos/ano")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return ax
+
+
+def grafico_saldo(serie: pd.DataFrame, titulo: str, ax=None):
+    ax = ax or plt.gca()
+    # No modo suavizado, usa o saldo reconstruído (sem os picos de rebaseamento).
+    coluna = "saldo_migratorio_suave" if "saldo_migratorio_suave" in serie.columns \\
+        else "saldo_migratorio"
+    dados = serie.dropna(subset=[coluna])
+    cores = ["#1f77b4" if v >= 0 else "#d62728" for v in dados[coluna]]
+    ax.bar(dados["ano"], dados[coluna], color=cores)
+    ax.axhline(0, color="black", linewidth=0.8)
+    sufixo = " (reconstruído)" if coluna.endswith("suave") else ""
+    ax.set_title(f"Saldo migratório líquido anual{sufixo} — {titulo}")
+    ax.set_xlabel("Ano")
+    ax.set_ylabel("Saldo (pessoas)")
+    ax.grid(True, alpha=0.3)
+    return ax
+
+
+def figura_completa(serie: pd.DataFrame, titulo: str):
+    """Monta uma figura 3-em-1 (usada tanto pela CLI quanto pelo Streamlit)."""
+    fig, axes = plt.subplots(3, 1, figsize=(10, 13))
+    grafico_populacao(serie, titulo, axes[0])
+    grafico_nasc_obitos(serie, titulo, axes[1])
+    grafico_saldo(serie, titulo, axes[2])
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Fontes e ressalvas
+# ---------------------------------------------------------------------------
+FONTES = {
+    "populacao": (
+        "População: IBGE (estimativas anuais + anos censitários) via Base dos "
+        "Dados — br_ibge_populacao.municipio. Anos de censo (2000/2010/2022) são "
+        "contagem; demais anos são estimativa."
+    ),
+    "nascimentos": (
+        "Nascimentos: SINASC/Ministério da Saúde via Base dos Dados — "
+        "br_ms_sinasc.microdados, contados por município de RESIDÊNCIA."
+    ),
+    "obitos": (
+        "Óbitos: SIM/Ministério da Saúde via Base dos Dados — "
+        "br_ms_sim.microdados, contados por município de RESIDÊNCIA."
+    ),
+    "vegetativo": (
+        "Crescimento vegetativo: cálculo próprio = nascimentos − óbitos (por ano)."
+    ),
+    "saldo_migratorio": (
+        "Saldo migratório: cálculo próprio pelo método do resíduo "
+        "(Δpopulação − crescimento vegetativo). É um saldo LÍQUIDO (não separa "
+        "entradas de saídas; inclui migração interna, internacional e "
+        "reconciliação estatística)."
+    ),
+    "diretorio": (
+        "Nomes/códigos de município: IBGE via Base dos Dados — "
+        "br_bd_diretorios_brasil.municipio."
+    ),
+}
+
+RESSALVAS = [
+    "Eventos contados por município de RESIDÊNCIA; residentes que tiveram o "
+    "evento em outra UF podem faltar (pequeno vazamento).",
+    "Registros sem município de residência (id nulo) são excluídos dos totais "
+    "municipais (volume reportado à parte).",
+    "Saldo migratório é LÍQUIDO — não distingue quem entrou de quem saiu.",
+    "Ao agregar 'todos do RS', filtramos id_municipio iniciados em 43; o filtro "
+    "sigla_uf pega a UF de OCORRÊNCIA e incluiria municípios de outras UFs.",
+    "O resíduo é um saldo 'contaminado': além da migração líquida, ele absorve "
+    "erros de contagem censitária e de sub-registro de nascimentos/óbitos. Não "
+    "é migração pura.",
+    "Pequenas áreas: em municípios pequenos o saldo pode ser da ordem do próprio "
+    "ruído (erro censitário + sub-registro). Os valores são mantidos (nada é "
+    "descartado), mas interprete municípios pequenos com cautela.",
+]
+
+# Notas de validação/triangulação: como conferir a ordem de grandeza do saldo.
+VALIDACAO = [
+    "Este saldo é pelo MÉTODO DO RESÍDUO no período intercensitário completo "
+    "(ex.: 2010–2022, ~12 anos) e é LÍQUIDO.",
+    "NÃO é diretamente comparável ao dado de migração do Censo por quesito "
+    "'data-fixa'. Ex.: o DEE-RS (Cadernos RS no Censo 2022) reporta, por "
+    "data-fixa 2017–2022, saldo líquido de −77,8 mil e taxa de −0,72% — mas "
+    "isso é fluxo BRUTO, 5 anos, só sobreviventes que mudaram de município de "
+    "referência; conceito e período diferentes.",
+    "Para validar sinal e ordem de grandeza, triangule com: (a) o quesito "
+    "data-fixa do Censo 2022; (b) a Razão de Sobrevivência Censitária (CSMR), "
+    "que estima migração líquida sem depender de SINASC/SIM. Convergência de "
+    "sinal entre os métodos é a melhor checagem disponível.",
+    "Referência: DEE-RS, 'Cadernos RS no Censo 2022: Migração e Fecundidade' "
+    "(nov/2025) — dee.rs.gov.br.",
+]
+
+
+def texto_correcoes(sigla_uf: str | None = None) -> list[str]:
+    """Lista as correções metodológicas ativas (lê o estado de config)."""
+    linhas = []
+    if config.FRACIONAR_FRONTEIRA:
+        linhas.append(
+            "Fronteira temporal: CORRIGIDA — os anos de ponta são ponderados "
+            "pela fração de meses dentro do intervalo censitário (censos com "
+            "referência em ~1º/ago), somando exatamente (fim − ini) anos.")
+    else:
+        linhas.append(
+            "Fronteira temporal: NÃO corrigida — soma de anos-calendário "
+            "inteiros superestima ~1 ano de vegetativo.")
+    if config.APLICAR_SUBREGISTRO:
+        nota = ""
+        if sigla_uf:
+            fat = config.fatores_subregistro(sigla_uf)
+            nota = (f" Fatores {sigla_uf}: nascimentos ×{fat['nascimentos']}, "
+                    f"óbitos ×{fat['obitos']} [{fat['fonte']}].")
+        linhas.append(
+            "Sub-registro: CORRIGIDO — nascimentos/óbitos multiplicados por "
+            "1/cobertura. Coberturas regionais APROXIMADAS (substitua pelos "
+            "fatores oficiais do IBGE por UF/ano via fatores_subregistro.csv)."
+            + nota)
+    else:
+        linhas.append("Sub-registro: NÃO corrigido (contagens brutas do SINASC/SIM).")
+    linhas.append(
+        f"Pequenas áreas: municípios com população < {config.LIMIAR_PEQUENA_AREA:,} "
+        "são SINALIZADOS (nunca removidos); nesses casos o saldo pode ser da "
+        "ordem do ruído.")
+    return linhas
+
+
+def texto_fontes(sigla_uf: str | None = None) -> str:
+    linhas = ["FONTES", "------"]
+    linhas += [f"• {v}" for v in FONTES.values()]
+    linhas += ["", "CORREÇÕES APLICADAS", "-------------------"]
+    linhas += [f"• {v}" for v in texto_correcoes(sigla_uf)]
+    linhas += ["", "RESSALVAS", "---------"]
+    linhas += [f"• {v}" for v in RESSALVAS]
+    linhas += ["", "VALIDAÇÃO / TRIANGULAÇÃO", "------------------------"]
+    linhas += [f"• {v}" for v in VALIDACAO]
+    return "\\n".join(linhas)
+
+
+# ---------------------------------------------------------------------------
+# Exportação
+# ---------------------------------------------------------------------------
+def exportar(
+    serie: pd.DataFrame,
+    intercensos: pd.DataFrame,
+    resumo: dict,
+    nome_base: str,
+    formato: str = "ambos",
+) -> list[Path]:
+    """Exporta série, intervalos e resumo. \`formato\`: 'csv', 'xlsx' ou 'ambos'."""
+    gerados: list[Path] = []
+    base = config.OUTPUT_DIR / nome_base
+
+    resumo_df = pd.DataFrame([resumo]) if resumo else pd.DataFrame()
+
+    if formato in ("csv", "ambos"):
+        p1 = base.with_name(f"{nome_base}_serie.csv")
+        serie.to_csv(p1, index=False, encoding="utf-8-sig")
+        gerados.append(p1)
+        if not intercensos.empty:
+            p2 = base.with_name(f"{nome_base}_intercensos.csv")
+            intercensos.to_csv(p2, index=False, encoding="utf-8-sig")
+            gerados.append(p2)
+
+    if formato in ("xlsx", "ambos"):
+        p3 = base.with_name(f"{nome_base}.xlsx")
+        try:
+            with pd.ExcelWriter(p3, engine="openpyxl") as xw:
+                serie.to_excel(xw, sheet_name="serie_anual", index=False)
+                if not intercensos.empty:
+                    intercensos.to_excel(
+                        xw, sheet_name="intercensos", index=False
+                    )
+                if not resumo_df.empty:
+                    resumo_df.to_excel(xw, sheet_name="resumo", index=False)
+            gerados.append(p3)
+        except ImportError:
+            # openpyxl ausente: XLSX é opcional, seguimos com CSV
+            pass
+
+    return gerados
+`,
+    "app.py": `"""
+App Streamlit para demografia municipal.
+
+Rodar:
+    streamlit run app.py   (ou dê dois cliques em "Abrir App Demografia.bat")
+
+Dois modos (menu na barra lateral):
+  • Município / Estado — série histórica, gráficos e cálculos de uma cidade ou
+    do agregado estadual.
+  • Ranking do estado — todos os municípios da UF ordenados por saldo migratório
+    (total ou % da população), com ordenação por clique nas colunas.
+"""
+from __future__ import annotations
+
+import streamlit as st
+
+import calculations
+import config
+import data_sources
+import municipios
+import reporting
+
+st.set_page_config(page_title="Demografia Municipal", layout="wide")
+st.title("📊 Demografia municipal — Brasil (foco RS)")
+st.caption(
+    "População, nascimentos, óbitos, crescimento vegetativo e saldo migratório. "
+    f"Período: {config.ANO_INICIAL}–{config.ANO_FINAL}."
+)
+
+# --- Estado do cache / billing ---------------------------------------------
+_cache_nacional = bool(
+    list(config.CACHE_DIR.glob("populacao-BR_*.parquet"))
+    or list(config.CACHE_DIR.glob("populacao-BR_*.csv"))
+)
+if _cache_nacional:
+    st.success("Cache nacional carregado — todos os municípios do Brasil "
+               "disponíveis localmente, sem consultar o BigQuery.")
+elif not config.get_billing_project_id():
+    st.warning(
+        "billing_project_id do Google Cloud não configurado e sem cache nacional. "
+        "Defina \`BILLING_PROJECT_ID\`/\`.billing_project\`, ou importe os CSVs "
+        "(importar_csv.py). Sem isso, só é possível visualizar UFs já em cache."
+    )
+
+# ---------------------------------------------------------------------------
+# Barra lateral: modo e UF
+# ---------------------------------------------------------------------------
+modo_app = st.sidebar.radio(
+    "Modo", ["Município / Estado", "Ranking do estado", "Metodologia"])
+uf = st.sidebar.selectbox(
+    "UF", ["RS", "SC", "PR", "SP", "MG", "RJ", "BA", "Outra..."]
+)
+if uf == "Outra...":
+    uf = st.sidebar.text_input("Digite a sigla da UF", value="RS").upper()
+
+
+@st.cache_data(show_spinner="Carregando diretório de municípios...")
+def _municipios_uf(sigla_uf: str):
+    return municipios.listar_por_uf(sigla_uf)
+
+
+@st.cache_data(show_spinner="Consultando/lendo cache...")
+def _serie_municipio(id_municipio: str, sigla_uf: str):
+    return calculations.construir_serie_municipio(id_municipio, sigla_uf)
+
+
+@st.cache_data(show_spinner="Agregando UF...")
+def _serie_uf(sigla_uf: str):
+    return calculations.construir_serie_uf(sigla_uf)
+
+
+@st.cache_data(show_spinner="Calculando ranking...")
+def _ranking(sigla_uf: str, intervalo: tuple[int, int]):
+    return calculations.ranking_uf(sigla_uf, intervalo)
+
+
+# ===========================================================================
+# MODO 1: Município / Estado
+# ===========================================================================
+if modo_app == "Município / Estado":
+    try:
+        lista = _municipios_uf(uf)
+        nomes = lista["nome"].tolist()
+    except Exception as exc:
+        st.error(f"Não foi possível carregar municípios de {uf}: {exc}")
+        st.stop()
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        modo_sel = st.radio("Selecionar por", ["Nome", "Código IBGE"],
+                            horizontal=True)
+    with col2:
+        if modo_sel == "Nome":
+            nome_sel = st.selectbox("Município", nomes)
+            id_sel = lista[lista["nome"] == nome_sel]["id_municipio"].iloc[0]
+        else:
+            id_sel = st.text_input("Código IBGE (7 dígitos)", value="4301602")
+
+    agregado = st.checkbox(f"Mostrar agregado do estado ({uf}) em vez do município")
+
+    col_s1, col_s2 = st.columns([1, 2])
+    with col_s1:
+        suavizar = st.checkbox(
+            "Uniformizar rebaseamentos do IBGE",
+            help="Reconstrói a população a partir dos censos (equação de "
+                 "balanço), removendo os saltos das revisões de estimativa.")
+    with col_s2:
+        metodo = st.radio(
+            "Distribuição do saldo migratório", ["uniforme", "proporcional"],
+            horizontal=True, disabled=not suavizar,
+            help="uniforme: mesmo nº de migrantes/ano. proporcional: "
+                 "proporcional à população (taxa ~constante).")
+
+    if st.button("Gerar análise", type="primary"):
+        try:
+            if agregado:
+                serie = _serie_uf(uf)
+                titulo = f"{uf} (agregado)"
+            else:
+                muni = municipios.resolver(id_sel, sigla_uf=uf)
+                serie = _serie_municipio(muni.id_municipio, uf)
+                titulo = str(muni)
+        except Exception as exc:
+            st.error(f"Erro: {exc}")
+            st.stop()
+
+        if serie.empty:
+            st.warning("Sem dados para o período.")
+            st.stop()
+
+        if suavizar:
+            serie = calculations.reconstruir_serie(serie, metodo=metodo)
+            st.info(f"Modo suavizado ativo (reconstrução intercensitária "
+                    f"'{metodo}'): população ancorada nos censos, sem os saltos "
+                    f"de rebaseamento das estimativas.")
+
+        intercensos = calculations.saldo_intercensitario(serie)
+        resumo = calculations.resumir(serie)
+
+        if resumo.get("pequena_area"):
+            st.warning("⚠ **Pequena área**: município pequeno — o saldo "
+                       "migratório pode ser da ordem do ruído (erro censitário + "
+                       "sub-registro). Valores mantidos; interprete com cautela.")
+
+        # Resumo em métricas
+        st.subheader(f"Resumo — {titulo}")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Pico populacional", f"{resumo['populacao_pico']:,}",
+                  f"em {resumo['ano_pico_populacional']}")
+        m2.metric("Vegetativo acumulado", f"{resumo['vegetativo_acumulado']:,}")
+        m3.metric("Saldo migratório acum.",
+                  f"{resumo['saldo_migratorio_acumulado']:,}")
+        # taxa % acumulada = saldo acumulado ÷ população inicial da série
+        pop0 = int(serie.iloc[0]["populacao"])
+        taxa = resumo["saldo_migratorio_acumulado"] / pop0 * 100
+        m4.metric("Saldo migratório acum. (% da pop. inicial)", f"{taxa:.1f}%")
+
+        # Gráficos
+        st.subheader("Gráficos")
+        st.pyplot(reporting.figura_completa(serie, titulo))
+
+        # Tabelas
+        st.subheader("Série anual")
+        st.caption("A coluna **saldo_pct** é o saldo migratório do ano em % da "
+                   "população daquele ano.")
+        st.dataframe(serie, use_container_width=True)
+
+        if not intercensos.empty:
+            st.subheader("Saldo migratório intercensitário (método robusto)")
+            st.dataframe(intercensos, use_container_width=True)
+
+        csv = serie.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button("Baixar série (CSV)", csv,
+                           file_name=f"{titulo}_serie.csv", mime="text/csv")
+
+        st.subheader("Fontes, correções e ressalvas")
+        st.text(reporting.texto_fontes(uf))
+
+# ===========================================================================
+# MODO 2: Ranking do estado
+# ===========================================================================
+elif modo_app == "Ranking do estado":
+    st.subheader(f"Ranking municipal — {uf}")
+
+    intervalos = {f"{a}–{b}": (a, b) for a, b in config.INTERVALOS_CENSO}
+    col_r1, col_r2, col_r3 = st.columns([1, 1, 1])
+    with col_r1:
+        rot_int = st.selectbox("Intervalo intercensitário",
+                               list(intervalos.keys()),
+                               index=len(intervalos) - 1)
+    with col_r2:
+        metrica = st.radio("Ordenar por", ["Saldo total", "% da população"],
+                           horizontal=True)
+    with col_r3:
+        sentido = st.radio("Ordem", ["Maiores primeiro", "Menores primeiro"],
+                           horizontal=True)
+
+    intervalo = intervalos[rot_int]
+
+    try:
+        rk = _ranking(uf, intervalo)
+    except Exception as exc:
+        st.error(f"Não foi possível calcular o ranking de {uf}: {exc}")
+        st.stop()
+
+    coluna = "saldo_migratorio" if metrica == "Saldo total" else "saldo_pct"
+    asc = sentido == "Menores primeiro"
+    rk = rk.sort_values(coluna, ascending=asc).reset_index(drop=True)
+    rk.index += 1  # posição no ranking (1..N)
+
+    st.caption(
+        f"{len(rk)} municípios de {uf}, intervalo {rot_int}. Método do resíduo "
+        "com pontas em anos de censo (população robusta). **Clique no cabeçalho "
+        "de qualquer coluna para reordenar.** \`saldo_pct\` = saldo ÷ população "
+        f"de {intervalo[0]}."
+    )
+
+    # métricas de topo: destaques
+    d1, d2 = st.columns(2)
+    top = rk.sort_values(coluna, ascending=False).iloc[0]
+    bot = rk.sort_values(coluna, ascending=False).iloc[-1]
+    def _fmt(v: float) -> str:
+        if coluna == "saldo_pct":
+            return f"{v:.1f}%"
+        return f"{v:,.0f}".replace(",", ".")
+
+    d1.metric(f"Maior {metrica.lower()}", f"{top['nome']}", _fmt(top[coluna]))
+    d2.metric(f"Menor {metrica.lower()}", f"{bot['nome']}", _fmt(bot[coluna]))
+
+    rk_show = rk.copy()
+    rk_show["Pequena área"] = rk_show["pequena_area"].map({True: "⚠", False: ""})
+    df_show = rk_show.rename(columns={
+        "nome": "Município", "pop_inicial": f"Pop. {intervalo[0]}",
+        "pop_final": f"Pop. {intervalo[1]}", "delta_pop": "Δ Pop.",
+        "vegetativo": "Vegetativo", "saldo_migratorio": "Saldo migratório",
+        "saldo_pct": "Saldo %",
+    })[["Município", f"Pop. {intervalo[0]}", f"Pop. {intervalo[1]}",
+        "Δ Pop.", "Vegetativo", "Saldo migratório", "Saldo %", "Pequena área"]]
+    st.dataframe(df_show, use_container_width=True, height=560)
+    st.caption("⚠ = pequena área (pop. inicial < "
+               f"{config.LIMIAR_PEQUENA_AREA:,}): saldo mais sujeito a ruído. "
+               "Nenhum município é removido.")
+
+    csv = rk.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button("Baixar ranking (CSV)", csv,
+                       file_name=f"ranking_{uf}_{intervalo[0]}_{intervalo[1]}.csv",
+                       mime="text/csv")
+
+# ===========================================================================
+# MODO 3: Metodologia
+# ===========================================================================
+else:
+    doc = config.BASE_DIR / "METODOLOGIA.md"
+    if doc.exists():
+        st.markdown(doc.read_text(encoding="utf-8"))
+        st.download_button("Baixar metodologia (Markdown)",
+                           doc.read_text(encoding="utf-8"),
+                           file_name="METODOLOGIA.md", mime="text/markdown")
+    else:
+        st.error("Arquivo METODOLOGIA.md não encontrado.")
+`,
+    "METODOLOGIA.md": `# Metodologia — Saldo migratório municipal pelo método do resíduo
+
+Este documento descreve, de forma completa e detalhada, toda a metodologia usada
+no app de demografia municipal: fontes, definições, o método do resíduo, as
+variantes de cálculo, as correções aplicadas, as ressalvas e como validar os
+resultados. Foi revisado contra fontes oficiais (IBGE, DATASUS, IUSSP/ONU) e a
+literatura demográfica brasileira (Cedeplar/UFMG, REBEP, DEE‑RS).
+
+---
+
+## 1. Objetivo e escopo
+
+Estimar, para cada município do Brasil (foco no Rio Grande do Sul), as séries
+históricas de **população, nascimentos, óbitos, crescimento vegetativo e saldo
+migratório líquido**, no período 2000–2022, e permitir comparações e rankings
+dentro de uma UF.
+
+O **saldo migratório líquido** é o objeto central e o mais delicado: não é
+medido diretamente, e sim **estimado por resíduo** da equação de balanço
+demográfico.
+
+---
+
+## 2. Fontes de dados
+
+| Série | Tabela (Base dos Dados / BigQuery) | Órgão | Observação |
+|---|---|---|---|
+| População | \`br_ibge_populacao.municipio\` | IBGE | Censos (2000, 2010, 2022) + estimativas anuais |
+| Nascimentos | \`br_ms_sinasc.microdados\` | Ministério da Saúde (SINASC) | Contagem por município de **residência** da mãe |
+| Óbitos | \`br_ms_sim.microdados\` | Ministério da Saúde (SIM) | Contagem por município de **residência** |
+| Nomes/códigos | \`br_bd_diretorios_brasil.municipio\` | IBGE | \`id_municipio\` (7 díg.), \`nome\`, \`sigla_uf\` |
+
+Os dados são baixados uma vez (via BigQuery ou por importação dos CSVs
+exportados do console) e ficam em **cache local (parquet)**. Nascimentos e
+óbitos são agregados **por município de residência e ano**, descartando
+registros sem município de residência (id nulo), cujo volume é reportado à
+parte.
+
+---
+
+## 3. Definições
+
+**Crescimento vegetativo (ou natural)** de um ano *t*:
+
+\`\`\`
+vegetativo(t) = nascimentos(t) − óbitos(t)
+\`\`\`
+
+**Equação de balanço demográfico** (identidade fundamental da demografia): a
+variação da população entre dois instantes é igual ao crescimento natural mais
+o saldo migratório líquido:
+
+\`\`\`
+Pop(t+1) − Pop(t) = [nascimentos − óbitos] + [imigrantes − emigrantes]
+                  = vegetativo(t)            + migração_líquida(t)
+\`\`\`
+
+**Saldo migratório líquido** é, portanto, o **resíduo**:
+
+\`\`\`
+migração_líquida = variação populacional − crescimento vegetativo
+\`\`\`
+
+É **líquido**: mede entradas menos saídas, não os fluxos brutos. Dois
+municípios com saldo zero podem ter rotatividade enorme ou nenhuma.
+
+---
+
+## 4. Método do resíduo — fundamentação
+
+O método é clássico e canônico na demografia, conhecido como *residual method*
+ou *vital statistics method*. Ele decorre diretamente da equação de balanço:
+isolando a migração como resíduo entre a variação populacional observada (por
+dois censos) e o crescimento natural medido pelas estatísticas vitais.
+
+Pressuposto central (Demopædia/IUSSP): as **omissões e dupla‑contagens devem ser
+semelhantes nos dois censos**. E uma consequência que precisa estar sempre
+explícita:
+
+> O resíduo captura a migração líquida **somada a todos os erros dos demais
+> componentes** (erro de contagem censitária + sub‑registro de nascimentos e
+> óbitos). Qualquer erro em população, nascimentos ou óbitos aparece como
+> "migração". Por isso o resíduo é, em parte, uma "lata de lixo" de erros.
+
+No Brasil, a tradição do Cedeplar/UFMG (José Alberto Magno de Carvalho, Rigotti)
+usa o método indireto/residual há décadas, justamente porque fornece o **saldo
+líquido do período intercensitário completo** sem exigir os quesitos migratórios
+do censo.
+
+---
+
+## 5. Variantes de cálculo
+
+### 5.1. Intercensitária (robusta) — recomendada
+
+Usa como âncoras os **anos de censo** (população mais confiável):
+
+\`\`\`
+saldo(ini→fim) = [Pop_censo(fim) − Pop_censo(ini)] − Σ vegetativo no período
+\`\`\`
+
+Intervalos: 2000–2010 e 2010–2022. Como as pontas são censos, este cálculo **não
+sofre** com os rebaseamentos das estimativas anuais.
+
+### 5.2. Anual (aproximação)
+
+Usa as estimativas anuais de população:
+
+\`\`\`
+saldo(t) ≈ [Pop(t+1) − Pop(t)] − vegetativo(t)
+\`\`\`
+
+Serve para visualizar a dinâmica ano a ano, mas herda o ruído e os **saltos de
+rebaseamento** das estimativas (ver §7).
+
+### 5.3. Saldo em %
+
+\`\`\`
+saldo_pct = saldo ÷ população inicial × 100
+\`\`\`
+
+Permite comparar municípios de portes diferentes (um saldo de −1.000 é enorme
+numa cidade de 3.000 e desprezível numa de 1.000.000).
+
+---
+
+## 6. Reconstrução / uniformização de rebaseamentos
+
+As estimativas anuais do IBGE usam o método matemático **AiBi** (Madeira &
+Simões, 1972): projetam a população municipal pela razão entre a tendência de
+crescimento do município (entre os dois últimos censos) e a da UF. Isso tem duas
+consequências:
+
+1. **Não incorpora migração recente por dado direto** — extrapola tendências.
+2. **Rebaseamento pós‑censo cria saltos**: quando um novo censo chega, a série é
+   re‑ancorada, gerando descontinuidades artificiais.
+
+O modo **"uniformizar rebaseamentos"** reconstrói a população ano a ano a partir
+dos censos, pela equação de balanço:
+
+\`\`\`
+Pop_suave(t+1) = Pop_suave(t) + vegetativo(t) + migração_suave(t)
+\`\`\`
+
+O saldo migratório **total** de cada intervalo é fixado pelas âncoras
+censitárias e distribuído entre os anos de duas formas:
+
+- **uniforme**: mesmo número de migrantes por ano;
+- **proporcional**: proporcional à população (taxa de migração ~constante).
+
+A série reconstruída passa **exatamente** pelos censos e não tem saltos.
+**Importante**: a distribuição é uma **suposição de suavização**, não uma
+medição anual — ela não capta choques migratórios concentrados em um único ano.
+
+---
+
+## 7. Ranking municipal
+
+Para cada município da UF, calcula o saldo migratório do intervalo
+intercensitário (default 2010–2022) pelo método do resíduo, com as pontas em
+anos de censo. Ordenável por **saldo total** ou **% da população**. Todos os
+municípios são mantidos (nenhum é removido); os pequenos são apenas
+**sinalizados** (ver §8.3).
+
+---
+
+## 8. Correções aplicadas
+
+As correções são controladas por parâmetros em \`config.py\` e podem ser
+ligadas/desligadas. Por padrão, **todas estão ativas**.
+
+### 8.1. Fronteira temporal
+
+Os censos têm data de referência em **~1º de agosto** (2000, 2010 e 2022),
+enquanto os eventos vitais são somados por ano‑calendário (jan–dez). Somar os
+anos de ponta inteiros inclui meses fora do intervalo censo‑a‑censo e
+**superestima o crescimento vegetativo** (empurra o saldo para mais negativo).
+
+Correção: ponderamos os anos de ponta pela fração de meses dentro do intervalo.
+Com referência em agosto (mês *M* = 8):
+
+\`\`\`
+peso(ano inicial) = (13 − M)/12 = 5/12   (ago–dez)
+peso(ano final)   = (M − 1)/12  = 7/12   (jan–jul)
+peso(anos do meio) = 1
+\`\`\`
+
+A soma dos pesos é exatamente \`fim − ini\` (ex.: 12 anos para 2010–2022, não 13).
+O próprio IBGE fraciona os anos de ponta ao montar a equação de balanço.
+
+**Efeito no RS 2010–2022**: o vegetativo cai de ~625 mil (anos inteiros) para
+~581 mil, e o saldo migratório passa de ~−439 mil para ~−395 mil.
+
+### 8.2. Sub‑registro de nascimentos e óbitos
+
+O SINASC/SIM não captam 100% dos eventos, e a cobertura **varia por região e no
+tempo**. Como o resíduo herda esse sub‑registro, corrigimos as contagens
+dividindo pela cobertura estimada:
+
+\`\`\`
+evento_corrigido = evento_observado ÷ cobertura = evento_observado × fator
+                   (fator = 1/cobertura ≥ 1)
+\`\`\`
+
+Coberturas **aproximadas** por Grande Região (padrão do app; **substitua pelos
+fatores oficiais do IBGE por UF/ano** para rigor):
+
+| Região | Cobertura nascimentos | Cobertura óbitos |
+|---|---|---|
+| Sul | 0,99 | 0,98 |
+| Sudeste | 0,99 | 0,98 |
+| Centro‑Oeste | 0,98 | 0,96 |
+| Nordeste | 0,95 | 0,90 |
+| Norte | 0,93 | 0,88 |
+
+No **RS** (Sul), os fatores são pequenos: nascimentos ×1,0101 e óbitos ×1,0204 —
+coerente com a cobertura alta e estável do Sul (>98–99% na literatura Scielo/
+RIPSA). Fora do Sul/Sudeste, e no início da série, a correção é mais relevante.
+
+**Override**: crie um arquivo \`fatores_subregistro.csv\` na pasta do projeto com
+colunas \`sigla_uf, fator_nascimentos, fator_obitos\` (valores oficiais do IBGE) e
+ele terá precedência sobre os defaults regionais.
+
+### 8.3. Sinalização de pequenas áreas
+
+Em municípios pequenos, o saldo migratório pode ser da **mesma ordem de grandeza
+do ruído** (erro censitário + sub‑registro). Municípios com população inicial
+abaixo do limiar (padrão **5.000**) são **sinalizados** (⚠), mas **nunca
+removidos** — o número, ainda que ruidoso, é preservado.
+
+---
+
+## 9. Ressalvas e limitações
+
+1. **Resíduo = migração + erros.** Não é migração pura; absorve erro censitário e
+   sub‑registro residual.
+2. **Só líquido, nunca bruto.** Não distingue quem entrou de quem saiu, nem
+   origem/destino.
+3. **Pequenas áreas.** Saldo individual pouco confiável; use com cautela e/ou
+   agregue (microrregiões, COREDEs).
+4. **Residência × ocorrência.** Contamos por residência (correto para o
+   balanço), mas há pequeno vazamento de residentes com evento em outra UF, e
+   erro de preenchimento da variável de residência.
+5. **Universo da UF.** No agregado "todos do RS" filtramos \`id_municipio\`
+   iniciado em 43; o filtro por \`sigla_uf\` das tabelas de eventos é por UF de
+   **ocorrência** e incluiria municípios de outras UFs.
+6. **Reconstrução é suavização**, não medição anual.
+7. **Estimativas anuais (AiBi)** não devem ser usadas para migração — por isso
+   ancoramos nos censos.
+
+---
+
+## 10. Validação e triangulação
+
+**Não existe** número oficial publicado de saldo migratório **municipal** pelo
+resíduo 2010–2022 para colar como *ground truth*. Estratégias de validação:
+
+- **Agregado estadual coerente**: a soma dos municípios do RS 2010–2022 deve
+  reproduzir o saldo estadual pela mesma equação de balanço IBGE (censo→censo −
+  vegetativo). É a validação conceitualmente idêntica.
+- **DEE‑RS (Cadernos RS no Censo 2022, nov/2025)**: reporta, pelo quesito
+  **data‑fixa 2017–2022**, saldo líquido de **−77,8 mil** e taxa de **−0,72%**.
+  ⚠ **Não é diretamente comparável**: é fluxo bruto, 5 anos, só sobreviventes que
+  mudaram de município de referência — período e conceito diferentes do resíduo
+  2010–2022. Use apenas como referência de **sinal e ordem de grandeza**.
+- **Razão de Sobrevivência Censitária (CSMR)**: estima migração líquida por idade
+  sem depender do SINASC/SIM (imune ao sub‑registro vital). Boa checagem cruzada.
+- **Quesito data‑fixa do Censo 2022**: fluxos diretos por origem‑destino.
+
+Regra prática: convergência de **sinal e ordem de grandeza** entre resíduo,
+CSMR e quesito censitário é a melhor validação disponível.
+
+---
+
+## 11. Alternativas metodológicas
+
+| Técnica | O que dá | Quando é preferível |
+|---|---|---|
+| **Resíduo / estatísticas vitais** (este app) | Saldo líquido do período intercensitário completo | Saldo coerente com o balanço; período não coincide com data‑fixa; boas estatísticas vitais (caso do RS) |
+| **Quesito data‑fixa** (censo) | Fluxos brutos, origem‑destino, 5 anos | Precisa de volumes de im/emigrantes e origens |
+| **Última etapa** (censo) | Movimento direto mais recente | Análise de fluxos, sem referência temporal fixa |
+| **Razão de Sobrevivência Censitária (CSMR)** | Migração líquida por idade/sexo, sem estatísticas vitais | Estrutura etária da migração; onde o registro vital é ruim |
+
+O resíduo é superior quando o objetivo é o **saldo líquido coerente com o balanço
+demográfico do período intercensitário** e há boa cobertura vital. Os quesitos
+censitários são superiores para **fluxos brutos e origem‑destino**.
+
+---
+
+## 12. Veredito
+
+A metodologia do resíduo **ancorada em censos, com correção de fronteira e de
+sub‑registro, é adequada** para o saldo migratório líquido do RS em nível
+estadual, de agregados (microrregiões/COREDEs) e de municípios médios/grandes.
+Para municípios pequenos, os valores são mantidos, mas devem ser lidos como
+aproximações ruidosas (sinalizados no app). Para fluxos brutos e origem‑destino,
+o método é inadequado por construção — use os quesitos censitários.
+
+---
+
+## 13. Referências
+
+- Demopædia (IUSSP/ONU) — *Vital statistics method* / *Residual method*:
+  http://en-ii.demopaedia.org/wiki/Vital_statistics_method
+- Preston, Heuveline & Guillot, *Demography: Measuring and Modeling Population
+  Processes*: https://archive.org/details/demographymeasur0000pres
+- IUSSP — *Tools for Demographic Estimation*:
+  https://demographicestimation.iussp.org/
+- IOM — *Migration Data Portal* (métodos):
+  https://www.migrationdataportal.org/
+- IBGE — Estimativas de população (método AiBi):
+  https://www.ibge.gov.br/estatisticas/sociais/populacao/9103-estimativas-de-populacao.html
+- IBGE — Estimativas de sub‑registro:
+  https://www.ibge.gov.br/estatisticas/sociais/populacao/26176-estimativa-do-sub-registro.html
+- Cobertura SINASC/SIM (Scielo/RIPSA):
+  https://www.scielo.br/j/csc/a/tyC6hXgsk54svFYk5KPGzhc/
+- Rigotti (Cedeplar/UFMG) — técnicas indiretas de migração:
+  https://repositorio.ufmg.br/server/api/core/bitstreams/1c62be65-009f-4d4b-954b-716ee8f22855/content
+- DATASUS — Estatísticas vitais: https://datasus.saude.gov.br/estatisticas-vitais/
+- DEE‑RS — *Cadernos RS no Censo 2022: Migração e Fecundidade* (nov/2025):
+  https://dee.rs.gov.br/censo-2022-aponta-mudancas-nos-padroes-de-fecundidade-e-destaca-os-principais-fluxos-migratorios-no-rs
+- Censo 2022 (data de referência): https://censo2022.ibge.gov.br/
+
+*As coberturas de sub‑registro embutidas no app são aproximações regionais; para
+publicação, substitua pelos valores oficiais do IBGE por UF/ano.*
+`,
+    "cache/diretorio-municipios_f6a64f4d28776ce8.csv": { url: "./cache/diretorio-municipios_f6a64f4d28776ce8.csv" },
+    "cache/nascimentos-BR_2ffeb5fd56a6fc2a.csv": { url: "./cache/nascimentos-BR_2ffeb5fd56a6fc2a.csv" },
+    "cache/obitos-BR_8b88895e25f077d1.csv": { url: "./cache/obitos-BR_8b88895e25f077d1.csv" },
+    "cache/populacao-BR_cdbf646a8ffc16fc.csv": { url: "./cache/populacao-BR_cdbf646a8ffc16fc.csv" },
+        },
+      },
+      document.getElementById("root"),
+    );
+  </script>
+</body>
+</html>

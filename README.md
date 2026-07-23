@@ -199,6 +199,34 @@ A seção "Fontes e ressalvas" impressa pela CLI/app traz esses pontos e a refer
 **Documentação completa:** [`METODOLOGIA.md`](METODOLOGIA.md) — também disponível
 no app (modo "Metodologia").
 
+## 6c. Versão web estática (stlite) — sem servidor
+
+Para publicar como página web **sem manter servidor/VM**, o app roda 100% no
+navegador via [stlite](https://github.com/whitphx/stlite) (Pyodide/WebAssembly):
+
+```bash
+python build_stlite.py
+```
+
+Isso gera a pasta `web/` (um `index.html` + o cache em CSV). Basta hospedar essa
+pasta em **qualquer servidor de arquivos estáticos** — intranet, SharePoint,
+GitHub Pages, bucket S3 — ou testar localmente:
+
+```bash
+python -m http.server 8080 --directory web
+```
+
+Acesse `http://localhost:8080`. O primeiro carregamento baixa o Python no
+navegador (~10–20 s); depois tudo é local. Requer acesso ao CDN do stlite
+(jsdelivr) no primeiro load.
+
+**GitHub Pages**: com o repositório publicado, habilite Pages apontando para a
+pasta `/web` na branch principal — a página fica no ar sem nenhum servidor.
+
+Limitação conhecida: o `st.download_button` gera um aviso 404 no console do
+stlite (o download funciona no clique; é apenas ruído). Todo o restante —
+cálculos, gráficos matplotlib, tabelas, ranking, metodologia — roda normalmente.
+
 ## 7. Alternativa sem BigQuery (opcional)
 
 `datasus_source.py` traz nascimentos/óbitos via **DATASUS** (`pip install pysus`),

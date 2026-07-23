@@ -28,7 +28,10 @@ st.caption(
 )
 
 # --- Estado do cache / billing ---------------------------------------------
-_cache_nacional = bool(list(config.CACHE_DIR.glob("populacao-BR_*.parquet")))
+_cache_nacional = bool(
+    list(config.CACHE_DIR.glob("populacao-BR_*.parquet"))
+    or list(config.CACHE_DIR.glob("populacao-BR_*.csv"))
+)
 if _cache_nacional:
     st.success("Cache nacional carregado — todos os municípios do Brasil "
                "disponíveis localmente, sem consultar o BigQuery.")
