@@ -208,20 +208,22 @@ navegador via [stlite](https://github.com/whitphx/stlite) (Pyodide/WebAssembly):
 python build_stlite.py
 ```
 
-Isso gera a pasta `web/` (um `index.html` + o cache em CSV). Basta hospedar essa
-pasta em **qualquer servidor de arquivos estáticos** — intranet, SharePoint,
-GitHub Pages, bucket S3 — ou testar localmente:
+Isso gera a pasta `docs/` (um `index.html` + o cache em CSV + `.nojekyll`). Basta
+hospedar essa pasta em **qualquer servidor de arquivos estáticos** — intranet,
+SharePoint, GitHub Pages, bucket S3 — ou testar localmente:
 
 ```bash
-python -m http.server 8080 --directory web
+python -m http.server 8080 --directory docs
 ```
 
 Acesse `http://localhost:8080`. O primeiro carregamento baixa o Python no
 navegador (~10–20 s); depois tudo é local. Requer acesso ao CDN do stlite
 (jsdelivr) no primeiro load.
 
-**GitHub Pages**: com o repositório publicado, habilite Pages apontando para a
-pasta `/web` na branch principal — a página fica no ar sem nenhum servidor.
+**GitHub Pages**: em Settings → Pages, selecione a branch `main` e a pasta
+**`/docs`**. A página fica no ar (ex.: `https://young-empreendimentos.github.io/
+demografia-municipal/`) sem nenhum servidor. O `.nojekyll` já evita o
+processamento Jekyll.
 
 Limitação conhecida: o `st.download_button` gera um aviso 404 no console do
 stlite (o download funciona no clique; é apenas ruído). Todo o restante —

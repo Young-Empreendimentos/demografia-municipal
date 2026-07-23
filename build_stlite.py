@@ -1,14 +1,16 @@
 """
 Gera uma versão 100% estática do app (stlite) que roda no NAVEGADOR, sem
-servidor/VM. Produz a pasta `web/` com:
+servidor/VM. Produz a pasta `docs/` com:
   • index.html  — carrega o stlite (via CDN) e monta o app;
-  • cache/*.csv — o cache nacional convertido para CSV (sem pyarrow no navegador).
+  • cache/*.csv — o cache nacional convertido para CSV (sem pyarrow no navegador);
+  • .nojekyll   — evita o processamento Jekyll no GitHub Pages.
 
-Basta hospedar a pasta `web/` em qualquer servidor de arquivos estáticos
-(intranet, SharePoint, GitHub Pages, bucket S3) ou abrir via um servidor local.
+A pasta se chama `docs/` porque o GitHub Pages serve nativamente de `/docs`
+(além da raiz). Também funciona em qualquer host estático (intranet, SharePoint,
+bucket S3) — é só copiar a pasta.
 
 Rodar:  python build_stlite.py
-Testar: python -m http.server 8080 --directory web   → http://localhost:8080
+Testar: python -m http.server 8080 --directory docs   → http://localhost:8080
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ import pandas as pd
 import config
 
 BASE = config.BASE_DIR
-WEB = BASE / "web"
+WEB = BASE / "docs"          # GitHub Pages serve nativamente de /docs
 WEB_CACHE = WEB / "cache"
 
 # Módulos Python embutidos no HTML (ordem não importa; o entrypoint é app.py).
@@ -117,10 +119,11 @@ def main() -> None:
 </html>
 """
     (WEB / "index.html").write_text(html, encoding="utf-8")
+    (WEB / ".nojekyll").write_text("", encoding="utf-8")  # Pages: sem Jekyll
     tam = (WEB / "index.html").stat().st_size / 1024
     print(f"Gerado: {WEB / 'index.html'} ({tam:.0f} KB)")
     print(f"Dados CSV em: {WEB_CACHE} ({len(csv_nomes)} arquivos)")
-    print("Teste local:  python -m http.server 8080 --directory web")
+    print("Teste local:  python -m http.server 8080 --directory docs")
     print("Depois abra:  http://localhost:8080")
 
 
