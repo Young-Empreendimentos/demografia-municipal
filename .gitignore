@@ -1,0 +1,19 @@
+# credenciais / configuração local (NUNCA versionar)
+.billing_project
+fatores_subregistro.csv   # opcional/local; contém seus fatores oficiais
+
+# saídas geradas (gráficos, CSV/XLSX exportados)
+output/*
+!output/.gitkeep
+
+# O cache nacional (cache/*-BR e diretório) É versionado de propósito, para o
+# app funcionar após o clone sem precisar de BigQuery. (decisão do projeto)
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# temporários
+_test_launcher.bat
