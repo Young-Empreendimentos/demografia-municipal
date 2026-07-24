@@ -64,9 +64,11 @@ STYLE_CSS = """
     .auth-nota { color:#94a3b8; font-size:.78rem; margin-top:1.5rem; }
     .btn-sec { margin-top:1.2rem; background:none; border:none; color:var(--indigo); cursor:pointer;
       font-size:.9rem; text-decoration:underline; }
-    #topbar { display:none; align-items:center; justify-content:flex-end; gap:.75rem;
-      font-family:system-ui,sans-serif; font-size:.85rem; color:var(--cinza);
-      padding:.5rem 1rem; background:#f8fafc; border-bottom:1px solid #e2e8f0; }
+    #topbar { display:none; position:fixed; bottom:0; right:0; z-index:2147483000;
+      align-items:center; gap:.6rem; font-family:system-ui,sans-serif; font-size:.8rem;
+      color:var(--cinza); padding:.45rem .75rem; background:rgba(248,250,252,.97);
+      border:1px solid #e2e8f0; border-right:none; border-bottom:none;
+      border-top-left-radius:10px; box-shadow:0 -2px 8px rgba(30,41,59,.1); }
     #topbar .email { font-weight:600; color:var(--tinta); }
     #topbar button { padding:.35rem .8rem; border:1px solid #e2e8f0; border-radius:8px;
       background:#fff; color:var(--tinta); cursor:pointer; font-size:.8rem; }
@@ -196,7 +198,9 @@ GATE_ANTES = f"""    import {{ createClient }} from
       supabase.auth.getSession().then(function (r) {{ decidir(r.data.session); }});
     }}
 
-    function startApp() {{
+    async function startApp() {{
+      const {{ mount }} = await import(
+        "https://cdn.jsdelivr.net/npm/@stlite/browser@{STLITE_VER}/build/stlite.js");
       mount("""
 
 GATE_DEPOIS = "    }"
@@ -264,8 +268,6 @@ def main() -> None:
     <div id="loading">Carregando…</div>
   </div>
   <script type="module">
-    import {{ mount }} from
-      "https://cdn.jsdelivr.net/npm/@stlite/browser@{STLITE_VER}/build/stlite.js";
 {GATE_ANTES}
       {{
         entrypoint: "app.py",
